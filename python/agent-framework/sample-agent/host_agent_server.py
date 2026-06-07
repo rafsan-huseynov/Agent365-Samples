@@ -47,6 +47,8 @@ from microsoft_agents_a365.runtime.environment_utils import (
     get_observability_authentication_scope,
 )
 from token_cache import cache_agentic_token, get_cached_agentic_token
+from observability import token_cache
+from observability.observability_token_service import acquire_initial_token, run_token_service
 
 # --- Configuration ---
 ms_agents_logger = logging.getLogger("microsoft_agents")
@@ -79,10 +81,10 @@ def create_and_run_host(
     use_microsoft_opentelemetry(
         enable_a365=True,
         enable_azure_monitor=False,
-        a365_token_resolver=lambda agent_id, tenant_id: get_cached_agentic_token(
-            tenant_id, agent_id
-        )
-        or "",
+        enable_console=True,
+        a365_use_s2s_endpoint=True,
+        a365_enable_observability_exporter=True,
+        a365_token_resolver=lambda aid, tid: token_cache.get_cached_token(aid, tid) or "",
     )
 
     host = GenericAgentHost(agent_class, *agent_args, **agent_kwargs)
@@ -159,8 +161,8 @@ class GenericAgentHost:
 
     async def _validate_agent_and_setup_context(self, context: TurnContext):
         logger.info("🔍 Validating agent and setting up context...")
-        tenant_id = context.activity.recipient.tenant_id
-        agent_id = context.activity.recipient.agentic_app_id
+        tenant_id = context.activity.recipient.tenant_id or os.getenv("AZURE_TENANT_ID")
+        agent_id = context.activity.recipient.agentic_app_id or os.getenv("AZURE_CLIENT_ID")
         logger.info(f"🔍 tenant_id={tenant_id}, agent_id={agent_id}")
 
         if not self.agent_instance:
@@ -210,7 +212,7 @@ class GenericAgentHost:
                     return
                 tenant_id, agent_id = result
 
-                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).agent_blueprint_id(os.getenv("AGENT365OBSERVABILITY__AGENTBLUEPRINTID")).build():
                     user_message = context.activity.text or ""
                     if not user_message.strip() or user_message.strip() == "/help":
                         return
@@ -266,7 +268,7 @@ class GenericAgentHost:
                     return
                 tenant_id, agent_id = result
 
-                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).agent_blueprint_id(os.getenv("AGENT365OBSERVABILITY__AGENTBLUEPRINTID")).build():
                     logger.info(f"📬 {notification_activity.notification_type}")
 
                     if not hasattr(
@@ -380,6 +382,24 @@ class GenericAgentHost:
         app["adapter"] = self.agent_app.adapter
 
         app.on_startup.append(lambda app: self.initialize_agent())
+        async def _start_obs_token(app):
+            await acquire_initial_token(
+                tenant_id=os.getenv("AGENT365_TENANT_ID"),
+                agent_id=os.getenv("AGENT365_AGENT_ID"),
+                blueprint_client_id=os.getenv("AGENT365_CLIENT_ID"),
+                blueprint_client_secret=os.getenv("AGENT365_CLIENT_SECRET"),
+                use_managed_identity=False,
+            )
+            app["obs_token_task"] = asyncio.create_task(
+                run_token_service(
+                    tenant_id=os.getenv("AGENT365_TENANT_ID"),
+                    agent_id=os.getenv("AGENT365_AGENT_ID"),
+                    blueprint_client_id=os.getenv("AGENT365_CLIENT_ID"),
+                    blueprint_client_secret=os.getenv("AGENT365_CLIENT_SECRET"),
+                    use_managed_identity=False,
+                )
+            )
+        app.on_startup.append(_start_obs_token)
         app.on_shutdown.append(lambda app: self.cleanup())
 
         desired_port = int(environ.get("PORT", 3978))
